@@ -282,6 +282,30 @@ class EstimateRemainingTests(unittest.TestCase):
         self.assertAlmostEqual(bench.estimate_remaining_s(elapsed_s=10.0, done_units=10.0, total_units=10.0), 0.0)
 
 
+class ThermalGovernorActionTests(unittest.TestCase):
+    def test_not_frozen_below_freeze_threshold_is_noop(self):
+        self.assertEqual(bench.thermal_governor_action(90.0, frozen=False, freeze_temp_c=100.0, resume_temp_c=80.0), "noop")
+
+    def test_not_frozen_reaches_freeze_threshold_freezes(self):
+        self.assertEqual(bench.thermal_governor_action(100.0, frozen=False, freeze_temp_c=100.0, resume_temp_c=80.0), "freeze")
+
+    def test_not_frozen_above_freeze_threshold_freezes(self):
+        self.assertEqual(bench.thermal_governor_action(105.0, frozen=False, freeze_temp_c=100.0, resume_temp_c=80.0), "freeze")
+
+    def test_frozen_still_above_resume_threshold_stays_frozen(self):
+        self.assertEqual(bench.thermal_governor_action(90.0, frozen=True, freeze_temp_c=100.0, resume_temp_c=80.0), "noop")
+
+    def test_frozen_reaches_resume_threshold_resumes(self):
+        self.assertEqual(bench.thermal_governor_action(80.0, frozen=True, freeze_temp_c=100.0, resume_temp_c=80.0), "resume")
+
+    def test_frozen_below_resume_threshold_resumes(self):
+        self.assertEqual(bench.thermal_governor_action(70.0, frozen=True, freeze_temp_c=100.0, resume_temp_c=80.0), "resume")
+
+    def test_no_hysteresis_band_still_toggles_correctly(self):
+        self.assertEqual(bench.thermal_governor_action(90.0, frozen=False, freeze_temp_c=90.0, resume_temp_c=90.0), "freeze")
+        self.assertEqual(bench.thermal_governor_action(90.0, frozen=True, freeze_temp_c=90.0, resume_temp_c=90.0), "resume")
+
+
 class WaitForCooldownTests(unittest.TestCase):
     def test_already_cool_returns_immediately(self):
         sleeps = []

@@ -440,15 +440,47 @@ def wait_for_cooldown(
     return temp
 
 
+def thermal_governor_action(temp_c: float, frozen: bool, freeze_temp_c: float, resume_temp_c: float) -> str:
+    """Гистерезис для SIGSTOP/SIGCONT: 'freeze' — заморозить процесс, 'resume' —
+    разморозить, 'noop' — не трогать. Чистая логика, без побочных эффектов."""
+    if not frozen and temp_c >= freeze_temp_c:
+        return "freeze"
+    if frozen and temp_c <= resume_temp_c:
+        return "resume"
+    return "noop"
+
+
 class HardwareSampler:
     """Фоновый сэмплер температуры/частот на время прогона одной конфигурации.
-    Если задан abort_temp_c — при превышении выставляет abort_event, чтобы
-    run_one_config прервал прогон раньше критической (115°C) точки."""
 
-    def __init__(self, interval_s: float = 2.0, abort_temp_c: float | None = None):
+    Без вентилятора один VAD-сегмент у тяжёлой модели может считаться минутами —
+    проверка "между сегментами" для них бесполезна, перегрев случается посреди
+    одного сегмента. Поэтому вместо (или вместе с) паузой между сегментами
+    сэмплер сам держит whisper-server на SIGSTOP/SIGCONT: увидел freeze_temp_c —
+    заморозил процесс ядром (вычисления встают мгновенно, без потери состояния),
+    остыло до resume_temp_c — разморозил. Реагирует раз в interval_s, то есть
+    даже посреди часового сегмента, а не только на его границе.
+
+    abort_temp_c — аварийный стоп конфигурации целиком, страховка на случай,
+    если заморозка почему-то не спасает (запас перед критическими 115°C)."""
+
+    def __init__(
+        self,
+        interval_s: float = 2.0,
+        abort_temp_c: float | None = None,
+        freeze_temp_c: float | None = None,
+        resume_temp_c: float | None = None,
+        target_pid: int | None = None,
+    ):
         self.interval_s = interval_s
         self.abort_temp_c = abort_temp_c
+        self.freeze_temp_c = freeze_temp_c
+        self.resume_temp_c = resume_temp_c
+        self.target_pid = target_pid
         self.abort_event = threading.Event()
+        self.frozen = False
+        self.frozen_s = 0.0
+        self._frozen_since: float | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.temp_samples: list[dict[str, float]] = []
@@ -459,9 +491,37 @@ class HardwareSampler:
             temps = read_thermal_zones()
             self.temp_samples.append(temps)
             self.freq_samples.append(read_cpu_freqs())
-            if self.abort_temp_c is not None and temps and max(temps.values()) >= self.abort_temp_c:
+            max_t = max(temps.values()) if temps else 0.0
+
+            if self.abort_temp_c is not None and temps and max_t >= self.abort_temp_c:
                 self.abort_event.set()
+
+            if self.target_pid is not None and self.freeze_temp_c is not None and self.resume_temp_c is not None:
+                action = thermal_governor_action(max_t, self.frozen, self.freeze_temp_c, self.resume_temp_c)
+                if action == "freeze":
+                    self._freeze()
+                elif action == "resume":
+                    self._resume()
+
             self._stop.wait(self.interval_s)
+
+    def _freeze(self):
+        try:
+            os.kill(self.target_pid, signal.SIGSTOP)
+        except OSError:
+            return
+        self.frozen = True
+        self._frozen_since = time.monotonic()
+
+    def _resume(self):
+        try:
+            os.kill(self.target_pid, signal.SIGCONT)
+        except OSError:
+            pass
+        if self._frozen_since is not None:
+            self.frozen_s += time.monotonic() - self._frozen_since
+        self.frozen = False
+        self._frozen_since = None
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -471,6 +531,10 @@ class HardwareSampler:
         self._stop.set()
         if self._thread:
             self._thread.join()
+        # SIGTERM/SIGKILL остановленному (SIGSTOP) процессу не доставляются, пока
+        # не пришёл SIGCONT — иначе server.terminate() в finally зависнет навсегда.
+        if self.frozen:
+            self._resume()
 
     def summary(self) -> dict:
         def avg_max(samples):
@@ -481,7 +545,11 @@ class HardwareSampler:
 
         avg_t, max_t = avg_max(self.temp_samples)
         avg_f, max_f = avg_max(self.freq_samples)
-        return {"avg_temp_c": avg_t, "max_temp_c": max_t, "avg_freq_khz": avg_f, "max_freq_khz": max_f}
+        return {
+            "avg_temp_c": avg_t, "max_temp_c": max_t,
+            "avg_freq_khz": avg_f, "max_freq_khz": max_f,
+            "frozen_s": self.frozen_s,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +633,9 @@ def cut_segment(wav_path: str, t0: float, t1: float, out_path: str) -> None:
     )
 
 
-def _post_multipart_file(url: str, field_name: str, file_path: str, timeout: float = 120.0) -> bytes:
+def _post_multipart_file(url: str, field_name: str, file_path: str, timeout: float = 1800.0) -> bytes:
+    # таймаут с большим запасом: пока whisper-server на SIGSTOP (см. HardwareSampler),
+    # HTTP-ответ не придёт, и это не сбой — клиент должен просто подождать разморозки
     boundary = uuid.uuid4().hex
     with open(file_path, "rb") as f:
         file_bytes = f.read()
@@ -657,18 +727,21 @@ def run_one_config(
     cutoff: float,
     workdir: str,
     max_temp_c: float | None = 108.0,
-    pace_temp_c: float | None = None,
-    pace_target_c: float = 80.0,
-    pace_timeout_s: float = 300.0,
+    freeze_temp_c: float | None = None,
+    resume_temp_c: float | None = None,
 ) -> BenchResult:
-    """pace_temp_c — без фана плата не тянет непрерывный прогон: перед каждым
-    сегментом, если температура уже высокая, ждём остывания. Пауза не входит
-    в wall_clock (RTF — время счёта, не время охлаждения)."""
+    """freeze_temp_c/resume_temp_c — без фана плата не тянет непрерывный прогон:
+    сэмплер сам держит whisper-server на SIGSTOP/SIGCONT (см. HardwareSampler),
+    реагируя даже посреди одного длинного сегмента. Время заморозки не входит
+    в RTF (RTF — время счёта, не время охлаждения)."""
     print(f"--- {config.model_name} {config.quant} threads={config.threads} "
           f"taskset={config.taskset_cores} flash_attn={config.flash_attn} ---", file=sys.stderr)
 
     server = start_whisper_server(config, port, prompt)
-    sampler = HardwareSampler(abort_temp_c=max_temp_c)
+    sampler = HardwareSampler(
+        abort_temp_c=max_temp_c, freeze_temp_c=freeze_temp_c,
+        resume_temp_c=resume_temp_c, target_pid=server.pid,
+    )
     aborted = False
     try:
         wait_for_server(f"http://127.0.0.1:{port}/")
@@ -676,7 +749,6 @@ def run_one_config(
 
         hyp_segments: list[tuple[float, float, str]] = []
         wall_clock_total = 0.0
-        paced_s = 0.0
         processed_speech_s = 0.0
         total_speech_s = sum(t1 - t0 for t0, t1 in vad_segments)
         run_start = time.monotonic()
@@ -686,10 +758,6 @@ def run_one_config(
                 aborted = True
                 print(f"перегрев (>={max_temp_c}°C), прогон конфигурации прерван досрочно", file=sys.stderr)
                 break
-            if pace_temp_c is not None and current_max_temp_c() >= pace_temp_c:
-                before = time.monotonic()
-                wait_for_cooldown(pace_target_c, pace_timeout_s)
-                paced_s += time.monotonic() - before
             seg_path = os.path.join(workdir, f"seg_{t0:.3f}_{t1:.3f}.wav")
             cut_segment(wav_path, t0, t1, seg_path)
             start = time.monotonic()
@@ -700,17 +768,16 @@ def run_one_config(
             hyp_segments.append((t0, t1, text))
 
             processed_speech_s += t1 - t0
-            running_rtf = wall_clock_total / processed_speech_s if processed_speech_s else 0.0
+            pure_wall_clock = max(0.0, wall_clock_total - sampler.frozen_s)
+            running_rtf = pure_wall_clock / processed_speech_s if processed_speech_s else 0.0
             eta_s = estimate_remaining_s(time.monotonic() - run_start, processed_speech_s, total_speech_s)
             print(f"  [{i + 1}/{n}] +{t1 - t0:.1f}с речи, RTF~{running_rtf:.2f}, "
-                  f"ETA конфигурации: {format_eta(eta_s)}", file=sys.stderr)
+                  f"заморожено: {sampler.frozen_s:.0f}с, ETA конфигурации: {format_eta(eta_s)}", file=sys.stderr)
             if (i + 1) % 10 == 0 or i + 1 == n:
                 print(f"прогресс: {config.model_name}/{config.quant} t={config.threads} fa={config.flash_attn} "
-                      f"{i + 1}/{n} сегментов, RTF~{running_rtf:.2f}, ETA конфигурации: {format_eta(eta_s)}",
-                      file=sys.stderr)
+                      f"{i + 1}/{n} сегментов, RTF~{running_rtf:.2f}, заморожено: {sampler.frozen_s:.0f}с, "
+                      f"ETA конфигурации: {format_eta(eta_s)}", file=sys.stderr)
 
-        if paced_s:
-            print(f"суммарно пауз на остывание: {paced_s:.0f}с", file=sys.stderr)
         peak_rss = peak_rss_kb(server.pid)
     finally:
         sampler.stop()
@@ -720,12 +787,17 @@ def run_one_config(
         except subprocess.TimeoutExpired:
             server.kill()
 
+    pure_wall_clock_total = max(0.0, wall_clock_total - sampler.frozen_s)
+    if sampler.frozen_s:
+        print(f"суммарно заморожено (SIGSTOP): {sampler.frozen_s:.0f}с", file=sys.stderr)
+
     result = BenchResult(
         config=config,
         # RTF считаем к реально обработанной речи (после VAD/--max-segments), а не
         # к длительности всего файла — иначе при усечении сегментов число подтасовано.
-        rtf=rtf(wall_clock_total, processed_speech_s) if not aborted else float("nan"),
-        wall_clock_s=wall_clock_total,
+        # Время заморозки (SIGSTOP) вычтено — RTF отражает чистую скорость счёта.
+        rtf=rtf(pure_wall_clock_total, processed_speech_s) if not aborted else float("nan"),
+        wall_clock_s=pure_wall_clock_total,
         peak_rss_mb=(peak_rss / 1024) if peak_rss else None,
         hw=sampler.summary(),
         aborted=aborted,
@@ -790,9 +862,10 @@ def main(argv: list[str] | None = None) -> int:
                          help="ждать остывания до этой температуры перед следующей конфигурацией")
     parser.add_argument("--cooldown-timeout-s", type=float, default=600.0,
                          help="не ждать остывания дольше этого времени")
-    parser.add_argument("--pace-temp-c", type=float, default=None,
-                         help="без активного охлаждения: пауза перед каждым сегментом при превышении")
-    parser.add_argument("--pace-target-c", type=float, default=80.0)
+    parser.add_argument("--freeze-temp-c", type=float, default=None,
+                         help="без вентилятора: держать whisper-server на SIGSTOP выше этой температуры")
+    parser.add_argument("--resume-temp-c", type=float, default=80.0,
+                         help="SIGCONT после остывания до этой температуры")
     parser.add_argument("--max-segments", type=int, default=None,
                          help="ограничить число VAD-сегментов на конфигурацию (для быстрой прикидки RTF)")
     args = parser.parse_args(argv)
@@ -848,8 +921,8 @@ def main(argv: list[str] | None = None) -> int:
                 config, vad_segments, wav_path, prompt,
                 args.port, terms, gold, args.cutoff, workdir,
                 max_temp_c=args.max_temp_c,
-                pace_temp_c=args.pace_temp_c,
-                pace_target_c=args.pace_target_c,
+                freeze_temp_c=args.freeze_temp_c,
+                resume_temp_c=args.resume_temp_c,
             )
             results.append(result)
             done = i + 1
