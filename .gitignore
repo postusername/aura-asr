@@ -6,5 +6,10 @@ archive/
 export/
 db.sqlite
 bench_runs/
+# записи созвонов и разметка: репозиторий публичный, данным команды тут не место
+data/
+gold*.tsv
+*.mp4
+*.wav
 __pycache__/
 *.pyc
