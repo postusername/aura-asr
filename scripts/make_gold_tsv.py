@@ -37,6 +37,35 @@ MANUAL_SPEAKER_IDS = {
 }
 
 
+def write_atomic(path: str, lines: list[str]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    os.replace(tmp, path)
+
+
+def rebuild_from_labels(args, gold) -> int:
+    """Собрать gold.tsv обратно после правки меток в Audacity: шапку Audacity
+    не сохраняет, поэтому call_id и wer_window возвращаются из прежнего файла."""
+    with open(args.from_labels, encoding="utf-8") as f:
+        label_lines = [ln for ln in f.read().splitlines() if ln.strip() and not ln.startswith("#")]
+
+    header = [f"# call_id: {gold.call_id}\n"]
+    if gold.wer_window is not None:
+        header.append(f"# wer_window: {gold.wer_window[0]:.3f} {gold.wer_window[1]:.3f}\n")
+
+    body = [ln if ln.endswith("\n") else ln + "\n" for ln in label_lines]
+    write_atomic(args.out, header + body)
+
+    with open(args.out, encoding="utf-8") as f:
+        check = bench.parse_gold_tsv(f.read())
+    bad = [s for s in check.segments if s.t1 <= s.t0]
+    print(f"собрано {len(check.segments)} сегментов -> {args.out}", file=sys.stderr)
+    if bad:
+        print(f"внимание: {len(bad)} сегментов нулевой/отрицательной длины", file=sys.stderr)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gold", required=True, help="существующий gold.tsv с ручной разметкой")
@@ -44,10 +73,21 @@ def main() -> int:
     parser.add_argument("--audio", required=True, help="запись, по ней считается VAD")
     parser.add_argument("--vad-model", default="/srv/asr/models/silero_vad.onnx")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--audacity-out", default=None,
+                        help="дополнительно записать версию без строк-комментариев: "
+                             "Audacity при импорте меток ждёт число в первой колонке "
+                             "и на '# call_id: ...' спотыкается")
+    parser.add_argument("--from-labels", default=None,
+                        help="собрать gold.tsv обратно из меток, выправленных в Audacity "
+                             "(шапка берётся из --gold, метки — отсюда)")
     args = parser.parse_args()
 
     with open(args.gold, encoding="utf-8") as f:
         gold = bench.parse_gold_tsv(f.read())
+
+    if args.from_labels:
+        return rebuild_from_labels(args, gold)
+
     if gold.wer_window is None:
         print("в gold.tsv нет wer_window — не понять, где ручная часть", file=sys.stderr)
         return 1
@@ -92,12 +132,13 @@ def main() -> int:
         t1 = bench.clip_end_by_vad(row.t0, t_next, vad)
         lines.append(f"{row.t0:.3f}\t{t1:.3f}\t{SPEAKER_IDS[row.speaker]}: {row.text}\n")
 
-    tmp_out = args.out + ".tmp"
-    with open(tmp_out, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-    os.replace(tmp_out, args.out)
-
+    write_atomic(args.out, lines)
     print(f"записано: {len(manual)} ручных строк + {len(tail)} из Толка -> {args.out}", file=sys.stderr)
+
+    if args.audacity_out:
+        labels = [ln for ln in lines if not ln.startswith("#")]
+        write_atomic(args.audacity_out, labels)
+        print(f"для импорта в Audacity (без шапки): {args.audacity_out}", file=sys.stderr)
     return 0
 
 
