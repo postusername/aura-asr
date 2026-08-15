@@ -116,6 +116,172 @@ def gold_reference_text(gold: GoldTranscript) -> str:
 
 
 # ---------------------------------------------------------------------------
+# расшифровка Контур.Толка (вход для gold.tsv и для кандидатов глоссария)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TolkRow:
+    t0: float
+    speaker: str
+    text: str
+
+
+_TOLK_TIME_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2})$")
+
+
+def parse_tolk_transcript(text: str) -> list[TolkRow]:
+    """Экспорт расшифровки Толка: `HH:MM:SS<TAB>Имя Фамилия<TAB>текст`.
+    Первая строка — заголовок, битые строки пропускаются молча: файл приходит
+    из внешней системы и мусор в нём не наша забота."""
+    rows = []
+    for line in text.splitlines():
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) != 3:
+            continue
+        m = _TOLK_TIME_RE.match(cols[0].strip())
+        if not m:
+            continue
+        h, mi, s = (int(x) for x in m.groups())
+        rows.append(TolkRow(t0=h * 3600 + mi * 60 + s, speaker=cols[1].strip(), text=cols[2].strip()))
+    return rows
+
+
+def clip_end_by_vad(
+    t0: float,
+    t_next: float,
+    vad_segments: list[tuple[float, float]],
+    fallback_s: float = 2.0,
+) -> float:
+    """Конец реплики по VAD, а не «до следующей реплики».
+
+    Толк даёт только время начала, поэтому наивное t1 = t0 следующей реплики
+    растягивает короткое «угу» на полминуты тишины. Берём конец последнего
+    речевого куска внутри интервала; если речи там нет — короткий fallback.
+    Результат всегда строго больше t0.
+
+    Если t_next не позже t0 (у Толка две реплики попали на одну секунду —
+    перебивание), ограничение сверху не применяется: по SPEC.md §7.3
+    перекрывающиеся интервалы допустимы, а сегмент нулевой длины — нет.
+    """
+    limit = t_next if t_next > t0 else t0 + fallback_s
+    ends = [min(e, limit) for s, e in vad_segments if s < limit and e > t0]
+    end = max(ends) if ends else t0 + fallback_s
+    return max(min(end, limit), t0 + 0.001)
+
+
+# ---------------------------------------------------------------------------
+# кандидаты в глоссарий (§7.2: латиница + разнобой написания в одном контексте)
+# ---------------------------------------------------------------------------
+
+_LATIN_RE = re.compile(r"[A-Za-z]")
+
+
+def has_latin(token: str) -> bool:
+    return bool(_LATIN_RE.search(token))
+
+
+# ponytail: фонетическая транслитерация «на глазок», нужна только чтобы сравнить
+# кириллическое искажение с латинским оригиналом («лок» ~ «LOC»). Потолок —
+# грубые пары вроде «щ»→«sch» и потеря мягкости; апгрейд при надобности —
+# готовая таблица ГОСТ/ISO 9, но для поиска кандидатов на вычитку хватает.
+_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "i", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "u", "я": "a",
+}
+
+
+def translit_key(token: str) -> str:
+    """Ключ сравнения: нижний регистр без пунктуации, кириллица транслитерирована."""
+    clean = _normalize_for_glossary_match(token)
+    return "".join(_TRANSLIT.get(ch, ch) for ch in clean)
+
+
+def cluster_variants(word_lists: list[list[str]], cutoff: float = 0.65) -> list[list[str]]:
+    """Группирует похожие написания из разных расшифровок одного окна.
+    Сравнение идёт по транслитерированному ключу, иначе «лок» и «LOC» никогда
+    не сойдутся. Возвращает кластеры (списки написаний как они встретились)."""
+    clusters: list[list[str]] = []
+    for words in word_lists:
+        for word in words:
+            key = translit_key(word)
+            placed = False
+            for cluster in clusters:
+                keys = [translit_key(w) for w in cluster]
+                if difflib.get_close_matches(key, keys, n=1, cutoff=cutoff):
+                    cluster.append(word)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([word])
+    return clusters
+
+
+@dataclass
+class GlossaryCandidate:
+    forms: dict[str, int]          # написание -> сколько раз встретилось
+    windows: list[float]           # начала окон, где встретился
+    has_latin: bool
+
+    @property
+    def total(self) -> int:
+        return sum(self.forms.values())
+
+
+def collect_glossary_candidates(
+    sources: list[list[tuple[float, str]]],
+    window_s: float = 30.0,
+    cutoff: float = 0.65,
+    min_len: int = 5,
+) -> list[GlossaryCandidate]:
+    """Кандидаты в глоссарий из нескольких расшифровок одного аудио.
+
+    Сигнал ровно из SPEC.md §7.2: латиница плюс слова, которые пишутся
+    по-разному в одинаковых контекстах. Контекст задаётся окном window_s —
+    расшифровки выровнены по времени, поэтому одно и то же слово у разных
+    моделей попадает в одно окно.
+
+    Короткие кириллические слова отбрасываются (min_len): на них difflib
+    слишком лоялен — «как», «так» и «там» отличаются одной буквой из трёх и
+    слипаются в один кластер, давая сплошной шум из служебных слов. Латиница
+    берётся от двух символов: аббревиатуры («XR», «LOC», «SSH») — как раз то,
+    ради чего глоссарий и заводится.
+    """
+    by_window: dict[int, list[list[str]]] = {}
+    for source in sources:
+        per_window: dict[int, list[str]] = {}
+        for t, word in source:
+            clean = _normalize_for_glossary_match(word)
+            floor = 2 if has_latin(clean) else min_len
+            if len(clean) < floor:
+                continue
+            per_window.setdefault(int(t // window_s), []).append(word.strip())
+        for idx, words in per_window.items():
+            by_window.setdefault(idx, []).append(words)
+
+    merged: dict[str, GlossaryCandidate] = {}
+    for idx, word_lists in sorted(by_window.items()):
+        for cluster in cluster_variants(word_lists, cutoff):
+            spellings = {_normalize_for_glossary_match(w) for w in cluster}
+            latin = any(has_latin(w) for w in cluster)
+            # интересны только несогласие моделей либо латиница
+            if len(spellings) < 2 and not latin:
+                continue
+            key = min(spellings)
+            cand = merged.get(key)
+            if cand is None:
+                cand = GlossaryCandidate(forms={}, windows=[], has_latin=latin)
+                merged[key] = cand
+            cand.has_latin = cand.has_latin or latin
+            cand.windows.append(idx * window_s)
+            for w in cluster:
+                cand.forms[w] = cand.forms.get(w, 0) + 1
+    return sorted(merged.values(), key=lambda c: -c.total)
+
+
+# ---------------------------------------------------------------------------
 # glossary.json (§7.2)
 # ---------------------------------------------------------------------------
 
@@ -235,10 +401,22 @@ def _normalize_for_glossary_match(text: str) -> str:
 # постобработка глоссария (два эшелона защиты терминологии, §9.1)
 # ---------------------------------------------------------------------------
 
-def apply_glossary(text: str, terms: list[GlossaryTerm], cutoff: float = 0.8) -> str:
-    """Нечёткая подстановка канонической формы термина вместо распознанного
-    варианта. Склонения латинских акронимов снимаются точным префиксным
-    правилом, остальное — difflib.get_close_matches по вариантам."""
+def apply_glossary(
+    text: str,
+    terms: list[GlossaryTerm],
+    cutoff: float = 0.85,
+    fuzzy_min_len: int = 4,
+) -> str:
+    """Подстановка канонической формы термина вместо распознанного варианта.
+
+    Точное совпадение с вариантом срабатывает всегда, нечёткое — только на
+    словах от fuzzy_min_len букв. Иначе на коротких словах difflib съедает
+    обычную речь: «ло» подтягивается к «лок» (LOC), «саш» к «ссаш» (SSH) —
+    имя человека превращается в протокол. Порог 0.85 подобран на записи
+    2026-08-12: при 0.8 «надо» девять раз становилось «NetBird».
+
+    Склонения латинских акронимов снимаются точным префиксным правилом.
+    """
     tokens = text.split(" ")
     norm_tokens = [_normalize_for_glossary_match(t) for t in tokens]
 
@@ -259,7 +437,11 @@ def apply_glossary(text: str, terms: list[GlossaryTerm], cutoff: float = 0.8) ->
                 matched = False
                 if n == 1 and declension_re is not None and declension_re.match(window_norm):
                     matched = True
-                elif difflib.get_close_matches(window_norm, candidates_norm, n=1, cutoff=cutoff):
+                elif window_norm in candidates_norm:
+                    matched = True
+                elif len(window_norm) >= fuzzy_min_len and difflib.get_close_matches(
+                    window_norm, candidates_norm, n=1, cutoff=cutoff
+                ):
                     matched = True
                 if matched:
                     tokens[i] = term.canon
@@ -714,6 +896,9 @@ class BenchResult:
     term_precision: float | None = None
     term_recall: float | None = None
     term_f1: float | None = None
+    # (t0, t1, text_raw) до нормализации глоссарием — SPEC.md §9.2: пересчёт по
+    # глоссарию должен быть секундами, а не повторным прогоном ASR на часы
+    raw_segments: list = field(default_factory=list)
 
 
 def run_one_config(
@@ -748,6 +933,7 @@ def run_one_config(
         sampler.start()
 
         hyp_segments: list[tuple[float, float, str]] = []
+        raw_segments: list[tuple[float, float, str]] = []
         wall_clock_total = 0.0
         processed_speech_s = 0.0
         total_speech_s = sum(t1 - t0 for t0, t1 in vad_segments)
@@ -766,6 +952,7 @@ def run_one_config(
             os.remove(seg_path)
             text = apply_glossary(raw_text, terms, cutoff) if terms else raw_text
             hyp_segments.append((t0, t1, text))
+            raw_segments.append((t0, t1, raw_text))
 
             processed_speech_s += t1 - t0
             pure_wall_clock = max(0.0, wall_clock_total - sampler.frozen_s)
@@ -801,6 +988,7 @@ def run_one_config(
         peak_rss_mb=(peak_rss / 1024) if peak_rss else None,
         hw=sampler.summary(),
         aborted=aborted,
+        raw_segments=raw_segments,
     )
 
     if not aborted and gold is not None and gold.wer_window is not None:
@@ -866,6 +1054,8 @@ def main(argv: list[str] | None = None) -> int:
                          help="без вентилятора: держать whisper-server на SIGSTOP выше этой температуры")
     parser.add_argument("--resume-temp-c", type=float, default=80.0,
                          help="SIGCONT после остывания до этой температуры")
+    parser.add_argument("--dump-hypotheses", default=None,
+                         help="куда сложить сырые гипотезы (JSON) для пересчёта метрик без ASR")
     parser.add_argument("--max-segments", type=int, default=None,
                          help="ограничить число VAD-сегментов на конфигурацию (для быстрой прикидки RTF)")
     args = parser.parse_args(argv)
@@ -939,6 +1129,24 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"остыло до {final_temp:.0f}°C, продолжаю", file=sys.stderr)
 
         print_table(results)
+        if args.dump_hypotheses:
+            dump = [
+                {
+                    "model": r.config.model_name, "quant": r.config.quant,
+                    "threads": r.config.threads, "flash_attn": r.config.flash_attn,
+                    "rtf": r.rtf, "aborted": r.aborted,
+                    "segments": [
+                        {"t0": t0, "t1": t1, "text_raw": text}
+                        for t0, t1, text in r.raw_segments
+                    ],
+                }
+                for r in results
+            ]
+            tmp = args.dump_hypotheses + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(dump, f, ensure_ascii=False)
+            os.replace(tmp, args.dump_hypotheses)
+            print(f"гипотезы сохранены: {args.dump_hypotheses}", file=sys.stderr)
     except Terminated:
         print("прерван SIGTERM, возвращаю governor и выхожу", file=sys.stderr)
         return 1

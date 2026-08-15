@@ -1,0 +1,31 @@
+{
+  "version": "2026-08-15",
+  "terms": [
+    {"canon": "VDA5050", "variants": ["вда 5050", "вэдэа 5050", "вда5050"], "prompt": true},
+    {"canon": "MAPF", "variants": ["мапф", "мэпф", "map f"], "prompt": true},
+    {"canon": "EECBS", "variants": ["исибиэс", "и си би эс"], "prompt": true},
+    {"canon": "ADG", "variants": ["адыжи", "а дэ гэ"], "prompt": true},
+    {"canon": "Isaac Sim", "variants": ["айзек сим", "изак сим", "айзак сим"], "prompt": false},
+    {"canon": "RKNN", "variants": ["эркеэнэн", "ар ка эн эн"], "prompt": true},
+    {"canon": "MQTT", "variants": ["эмкьютити", "эм ку ти ти"], "prompt": true},
+
+    {"canon": "SSH", "variants": ["ссаш", "эсаш", "сш", "ссс"], "prompt": true},
+    {"canon": "TLS", "variants": ["тлс", "тлса", "тэлэс"], "prompt": true},
+    {"canon": "VPN", "variants": ["впн", "вэпээн"], "prompt": true},
+    {"canon": "WebRTC", "variants": ["вебртс", "ве артиси", "артиси", "эртиси", "wbrtc", "вэбартиси"], "prompt": true},
+    {"canon": "NetBird", "variants": ["нетборд", "нетберд", "нетбёрд", "netbeard", "нетбертиш"], "prompt": true},
+    {"canon": "WireGuard", "variants": ["вайргард", "вгарид", "вай гор", "вайгард"], "prompt": true},
+    {"canon": "iptables", "variants": ["айпитейблс", "ипитейблс", "айпи таблс"], "prompt": false},
+    {"canon": "Docker", "variants": ["докер", "докир"], "prompt": true},
+    {"canon": "Unity", "variants": ["юнити", "юнитй", "winitry", "юнитой", "юнутри"], "prompt": true},
+    {"canon": "GitHub", "variants": ["гитхаб", "гитте", "гит хаб"], "prompt": true},
+    {"canon": "README", "variants": ["ридми", "выдме", "эдме", "выдми"], "prompt": true},
+
+    {"canon": "ASR", "variants": ["аср", "а эс эр"], "prompt": true},
+    {"canon": "XR", "variants": ["икс эр"], "prompt": true},
+    {"canon": "LOC", "variants": ["лок", "локт", "лог"], "prompt": true},
+    {"canon": "PUR", "variants": ["пур", "пурр"], "prompt": true},
+    {"canon": "LEARN", "variants": ["лерн", "лёрн"], "prompt": true},
+    {"canon": "ROUTINE", "variants": ["рутин", "рутина"], "prompt": true}
+  ]
+}

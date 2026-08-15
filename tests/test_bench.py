@@ -141,6 +141,42 @@ class GlossaryTermTests(unittest.TestCase):
         out = bench.apply_glossary("сегодня хорошая погода", self._terms())
         self.assertEqual(out, "сегодня хорошая погода")
 
+    def test_exact_variant_matches_even_when_short(self):
+        # «сш» короче порога нечёткого сравнения, но это точный вариант
+        terms = [bench.GlossaryTerm("SSH", ["ссаш", "сш"], True)]
+        self.assertEqual(bench.apply_glossary("зайди по сш на хост", terms), "зайди по SSH на хост")
+
+
+class GlossaryFalsePositiveTests(unittest.TestCase):
+    """Регрессии на реальных ложных срабатываниях, найденных на записи 2026-08-12."""
+
+    def test_common_word_not_replaced_by_similar_term(self):
+        terms = [bench.GlossaryTerm("NetBird", ["нетборд", "нетберд"], True)]
+        self.assertEqual(bench.apply_glossary("это надо сделать", terms), "это надо сделать")
+
+    def test_personal_name_not_replaced_by_acronym(self):
+        terms = [bench.GlossaryTerm("SSH", ["ссаш", "эсаш"], True)]
+        for phrase in ("саш подскажи", "Саш подскажи"):
+            self.assertNotIn("SSH", bench.apply_glossary(phrase, terms))
+
+    def test_short_word_not_fuzzy_matched(self):
+        terms = [bench.GlossaryTerm("LOC", ["лок", "локт"], True)]
+        self.assertEqual(bench.apply_glossary("ну ло и что", terms), "ну ло и что")
+
+    def test_unrelated_long_word_not_replaced(self):
+        terms = [bench.GlossaryTerm("Unity", ["юнити", "юнутри"], True)]
+        self.assertEqual(bench.apply_glossary("лежит внутри папки", terms), "лежит внутри папки")
+
+    def test_real_distortion_still_replaced(self):
+        terms = [
+            bench.GlossaryTerm("NetBird", ["нетборд", "нетберд"], True),
+            bench.GlossaryTerm("Unity", ["юнити", "юнутри"], True),
+            bench.GlossaryTerm("LOC", ["лок", "локт"], True),
+        ]
+        self.assertIn("NetBird", bench.apply_glossary("порты в нетборде", terms))
+        self.assertIn("Unity", bench.apply_glossary("папка юнутри проекта", terms))
+        self.assertIn("LOC", bench.apply_glossary("это лок задача", terms))
+
 
 class CountCanonOccurrencesTests(unittest.TestCase):
     def test_counts_word_boundary_matches(self):
@@ -251,6 +287,136 @@ class ParseProcStatusVmHwmTests(unittest.TestCase):
 
     def test_missing_field_returns_none(self):
         self.assertIsNone(bench.parse_proc_status_vmhwm("Name:\tx\n"))
+
+
+class ParseTolkTranscriptTests(unittest.TestCase):
+    def test_parses_header_and_rows(self):
+        text = (
+            'Транскрипция записи "2026-08-12" 12 августа 2026 г\n'
+            "00:00:01\tАндрей Павлов\tИтак, коллеги.\n"
+            "00:01:05\tПавел Шубин\tДа, привет.\n"
+        )
+        rows = bench.parse_tolk_transcript(text)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].t0, 1.0)
+        self.assertEqual(rows[0].speaker, "Андрей Павлов")
+        self.assertEqual(rows[0].text, "Итак, коллеги.")
+        self.assertEqual(rows[1].t0, 65.0)
+
+    def test_skips_blank_and_malformed_lines(self):
+        text = (
+            "заголовок\n"
+            "\n"
+            "00:00:01\tАндрей Павлов\tТекст.\n"
+            "мусор без табов\n"
+        )
+        rows = bench.parse_tolk_transcript(text)
+        self.assertEqual(len(rows), 1)
+
+    def test_hours_parsed(self):
+        text = "заголовок\n01:02:03\tX Y\tтекст\n"
+        rows = bench.parse_tolk_transcript(text)
+        self.assertEqual(rows[0].t0, 3723.0)
+
+
+class ClipEndByVadTests(unittest.TestCase):
+    def test_uses_last_vad_segment_inside_interval(self):
+        vad = [(0.0, 1.0), (10.0, 12.5), (13.0, 14.0), (40.0, 41.0)]
+        # реплика 10..30, речь внутри кончается на 14.0
+        self.assertEqual(bench.clip_end_by_vad(10.0, 30.0, vad, fallback_s=2.0), 14.0)
+
+    def test_falls_back_when_no_speech_inside(self):
+        vad = [(0.0, 1.0), (40.0, 41.0)]
+        self.assertEqual(bench.clip_end_by_vad(10.0, 30.0, vad, fallback_s=2.0), 12.0)
+
+    def test_fallback_clamped_by_next_row(self):
+        vad = []
+        self.assertEqual(bench.clip_end_by_vad(10.0, 10.5, vad, fallback_s=2.0), 10.5)
+
+    def test_vad_segment_crossing_next_row_is_clamped(self):
+        vad = [(10.0, 45.0)]
+        self.assertEqual(bench.clip_end_by_vad(10.0, 30.0, vad, fallback_s=2.0), 30.0)
+
+    def test_never_returns_zero_length(self):
+        vad = [(10.0, 10.0)]
+        self.assertGreater(bench.clip_end_by_vad(10.0, 30.0, vad, fallback_s=2.0), 10.0)
+
+    def test_simultaneous_rows_do_not_collapse(self):
+        # у Толка две реплики попали на одну секунду — перебивание
+        vad = [(10.0, 13.0)]
+        t1 = bench.clip_end_by_vad(10.0, 10.0, vad, fallback_s=2.0)
+        self.assertGreater(t1, 10.0)
+
+    def test_next_row_before_start_does_not_collapse(self):
+        t1 = bench.clip_end_by_vad(10.0, 9.0, [], fallback_s=2.0)
+        self.assertGreater(t1, 10.0)
+
+
+class HasLatinTests(unittest.TestCase):
+    def test_pure_latin(self):
+        self.assertTrue(bench.has_latin("VDA5050"))
+
+    def test_mixed(self):
+        self.assertTrue(bench.has_latin("ADGу"))
+
+    def test_cyrillic_only(self):
+        self.assertFalse(bench.has_latin("привет"))
+
+    def test_digits_only(self):
+        self.assertFalse(bench.has_latin("5050"))
+
+
+class ClusterVariantsTests(unittest.TestCase):
+    def test_groups_similar_spellings(self):
+        word_lists = [["дейлике"], ["делике"], ["дейлик"]]
+        clusters = bench.cluster_variants(word_lists, cutoff=0.7)
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(set(clusters[0]), {"дейлике", "делике", "дейлик"})
+
+    def test_keeps_unrelated_words_apart(self):
+        word_lists = [["привет"], ["дейлик"]]
+        clusters = bench.cluster_variants(word_lists, cutoff=0.7)
+        self.assertEqual(len(clusters), 2)
+
+    def test_identical_words_form_single_cluster(self):
+        word_lists = [["привет"], ["привет"]]
+        clusters = bench.cluster_variants(word_lists, cutoff=0.7)
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(clusters[0], ["привет", "привет"])
+
+
+class GlossaryCandidatesTests(unittest.TestCase):
+    def _sources(self):
+        return [
+            [(1.0, "у"), (1.2, "нас"), (1.4, "лок"), (1.6, "сломался")],
+            [(1.0, "у"), (1.2, "нас"), (1.4, "LOC"), (1.6, "сломался")],
+        ]
+
+    def test_latin_token_is_candidate(self):
+        cands = bench.collect_glossary_candidates(self._sources(), window_s=30.0)
+        forms = {frozenset(c.forms) for c in cands}
+        self.assertTrue(any("loc" in f or "LOC" in f for f in forms))
+
+    def test_cyrillic_and_latin_spellings_join_via_translit(self):
+        # min_len явно: проверяется склейка через транслитерацию, не порог длины
+        cands = bench.collect_glossary_candidates(self._sources(), window_s=30.0, min_len=3)
+        joined = {tuple(sorted(c.forms)) for c in cands}
+        self.assertTrue(any("лок" in t and "LOC" in t for t in joined))
+
+    def test_agreeing_common_words_are_not_candidates(self):
+        cands = bench.collect_glossary_candidates(self._sources(), window_s=30.0, min_len=3)
+        all_forms = {f for c in cands for f in c.forms}
+        self.assertNotIn("нас", all_forms)
+        self.assertNotIn("сломался", all_forms)
+
+    def test_window_separates_distant_occurrences(self):
+        sources = [
+            [(1.0, "локом")],
+            [(600.0, "лаком")],
+        ]
+        cands = bench.collect_glossary_candidates(sources, window_s=30.0)
+        for c in cands:
+            self.assertLessEqual(len(c.forms), 1)
 
 
 class FormatEtaTests(unittest.TestCase):
