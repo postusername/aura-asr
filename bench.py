@@ -1054,6 +1054,8 @@ def main(argv: list[str] | None = None) -> int:
                          help="без вентилятора: держать whisper-server на SIGSTOP выше этой температуры")
     parser.add_argument("--resume-temp-c", type=float, default=80.0,
                          help="SIGCONT после остывания до этой температуры")
+    parser.add_argument("--no-prompt", action="store_true",
+                         help="не подавать глоссарий в --prompt, оставить только постобработку")
     parser.add_argument("--dump-hypotheses", default=None,
                          help="куда сложить сырые гипотезы (JSON) для пересчёта метрик без ASR")
     parser.add_argument("--max-segments", type=int, default=None,
@@ -1076,7 +1078,12 @@ def main(argv: list[str] | None = None) -> int:
             gold = parse_gold_tsv(f.read())
     if args.glossary:
         terms = load_glossary(args.glossary)
-        prompt = glossary_prompt_text(terms)
+        # промпт — первый эшелон защиты терминологии (SPEC.md §9.1), но он не
+        # бесплатный: на записи 2026-08-12 промпт из 22 терминов поднял WER с
+        # 0.359 до 0.399, «слыша» технику там, где её нет. Второй эшелон
+        # (постобработка) при этом WER не меняет вовсе, поэтому их полезно
+        # уметь включать по отдельности и мерить порознь.
+        prompt = "" if args.no_prompt else glossary_prompt_text(terms)
 
     changed_governors = [] if args.no_governor else set_governor("performance")
     try:
